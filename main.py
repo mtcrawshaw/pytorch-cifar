@@ -10,52 +10,72 @@ import torchvision.transforms as transforms
 
 import os
 import argparse
+import pickle
+
+import numpy as np
 
 from models import *
-from utils import progress_bar
 
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--resume', '-r', action='store_true',
-                    help='resume from checkpoint')
+parser.add_argument('--gpu', default=None, type=int, help='gpu index')
+parser.add_argument('--epochs', default=200, type=int, help='epochs')
+parser.add_argument('--optimizer', default="SGD", type=str, help='optimizer')
+parser.add_argument('--beta1', default=0.9, type=float, help='adam beta1')
+parser.add_argument('--beta2', default=0.999, type=float, help='adam beta2')
+parser.add_argument('--eps', default=1e-8, type=float, help='adam epsilon')
+parser.add_argument('--dataset', default='CIFAR10', type=str, help='dataset')
+parser.add_argument('--name', default='experiment', type=str, help='name of experiment')
 args = parser.parse_args()
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-best_acc = 0  # best test accuracy
-start_epoch = 0  # start from epoch 0 or last checkpoint epoch
+device = f'cuda:{args.gpu}' if (torch.cuda.is_available() and args.gpu is not None) else 'cpu'
 
 # Data
 print('==> Preparing data..')
-transform_train = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+if args.dataset == "CIFAR10":
+    dset = torchvision.datasets.CIFAR10
+    channels = 3
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+elif args.dataset == "MNIST":
+    dset = torchvision.datasets.MNIST
+    channels = 1
+    transform_train = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+    ])
+else:
+    raise NotImplementedError
 
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
-
-trainset = torchvision.datasets.CIFAR10(
-    root='./data', train=True, download=True, transform=transform_train)
+trainset = dset(
+    root='./data', train=True, download=True, transform=transform_train
+)
 trainloader = torch.utils.data.DataLoader(
     trainset, batch_size=128, shuffle=True, num_workers=2)
-
-testset = torchvision.datasets.CIFAR10(
-    root='./data', train=False, download=True, transform=transform_test)
+testset = dset(
+    root='./data', train=False, download=True, transform=transform_test
+)
 testloader = torch.utils.data.DataLoader(
     testset, batch_size=100, shuffle=False, num_workers=2)
 
-classes = ('plane', 'car', 'bird', 'cat', 'deer',
-           'dog', 'frog', 'horse', 'ship', 'truck')
 
 # Model
 print('==> Building model..')
 # net = VGG('VGG19')
-# net = ResNet18()
+net = ResNet18(channels=channels)
 # net = PreActResNet18()
 # net = GoogLeNet()
 # net = DenseNet121()
@@ -68,25 +88,23 @@ print('==> Building model..')
 # net = ShuffleNetV2(1)
 # net = EfficientNetB0()
 # net = RegNetX_200MF()
-net = SimpleDLA()
+# net = SimpleDLA()
 net = net.to(device)
-if device == 'cuda':
-    net = torch.nn.DataParallel(net)
+if 'cuda' in device:
     cudnn.benchmark = True
 
-if args.resume:
-    # Load checkpoint.
-    print('==> Resuming from checkpoint..')
-    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-    checkpoint = torch.load('./checkpoint/ckpt.pth')
-    net.load_state_dict(checkpoint['net'])
-    best_acc = checkpoint['acc']
-    start_epoch = checkpoint['epoch']
-
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=args.lr,
-                      momentum=0.9, weight_decay=5e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+optim_kwargs = {"lr": args.lr, "weight_decay": 5e-4}
+if args.optimizer == "SGD":
+    optim_kwargs["momentum"] = 0.9
+    optimizer = optim.SGD(net.parameters(), **optim_kwargs)
+elif args.optimizer == "Adam":
+    optim_kwargs["betas"] = (args.beta1, args.beta2)
+    optim_kwargs["eps"] = args.eps
+    optimizer = optim.Adam(net.parameters(), **optim_kwargs)
+else:
+    raise NotImplementedError
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
 
 # Training
@@ -109,12 +127,14 @@ def train(epoch):
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
-        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+    avg_loss = train_loss / total
+    avg_acc = 100. * correct / total
+    print(f"Train loss: {avg_loss:.6f}, Train acc: {avg_acc:.3f}")
+
+    return avg_loss, avg_acc
 
 
 def test(epoch):
-    global best_acc
     net.eval()
     test_loss = 0
     correct = 0
@@ -130,25 +150,39 @@ def test(epoch):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-            progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        avg_loss = test_loss / total
+        avg_acc =  100. * correct / total
+        print(f"Test loss: {avg_loss:.6f}, test acc: {avg_acc:.3f}")
 
-    # Save checkpoint.
-    acc = 100.*correct/total
-    if acc > best_acc:
-        print('Saving..')
-        state = {
-            'net': net.state_dict(),
-            'acc': acc,
-            'epoch': epoch,
-        }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/ckpt.pth')
-        best_acc = acc
+    return avg_loss, avg_acc
 
 
-for epoch in range(start_epoch, start_epoch+200):
-    train(epoch)
-    test(epoch)
+# Run training.
+train_losses = []
+train_accs = []
+test_losses = []
+test_accs = []
+for epoch in range(args.epochs):
+
+    train_loss, train_acc = train(epoch)
+    test_loss, test_acc = test(epoch)
     scheduler.step()
+
+    train_losses.append(train_loss)
+    train_accs.append(train_acc)
+    test_losses.append(test_loss)
+    test_accs.append(test_acc)
+
+# Save results to file.
+results = {
+    "train_losses": np.array(train_losses),
+    "train_accs": np.array(train_accs),
+    "test_losses": np.array(test_losses),
+    "test_accs": np.array(test_accs),
+}
+results_file = os.path.join("logs", f"{args.name}.pkl")
+results_dir = os.path.dirname(results_file)
+if not os.path.isdir(results_dir):
+    os.makedirs(results_dir)
+with open(results_file, "wb") as f:
+    pickle.dump(results, f)
